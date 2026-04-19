@@ -1,0 +1,24 @@
+{
+  "name": "filom",
+  "version": "1.0.0",
+  "description": "文件上传下载 + 聊天室，基于 Koa",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js"
+  },
+  "dependencies": {
+    "@koa/cors": "^5.0.0",
+    "better-sqlite3": "^12.9.0",
+    "koa": "^2.15.3",
+    "koa-body": "^6.0.1",
+    "koa-router": "^12.0.1",
+    "koa-static": "^5.0.0",
+    "mime-types": "^2.1.35",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
