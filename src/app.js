@@ -8,6 +8,8 @@ const cors = require('@koa/cors');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { pipeline } = require('stream/promises');
+const Busboy = require('busboy');
 const { v4: uuidv4 } = require('uuid');
 const mime = require('mime-types');
 const WebSocket = require('ws');
@@ -16,9 +18,17 @@ const Database = require('better-sqlite3');
 const app = new Koa();
 const router = new Router();
 
+// ─── 目录配置 ──────────────────────────────────────────────
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const DB_PATH = path.join(__dirname, 'chat.db');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const CHUNK_DIR = path.join(__dirname, 'chunks');
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+const SESSIONS_LOCK = path.join(__dirname, 'sessions.lock');
+
+// 确保目录存在
+[UPLOAD_DIR, CHUNK_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
 // ─── Database ────────────────────────────────────────────────
 const db = new Database(DB_PATH);
@@ -62,16 +72,24 @@ function loadHistory() {
 
 // ─── Middleware ──────────────────────────────────────────────
 app.use(cors());
-app.use(
-  koaBody({
+
+// koaBody 只处理非分片上传的路由
+app.use(async (ctx, next) => {
+  // 分片上传路由跳过 koaBody，让 Busboy 直接处理原始请求
+  if (ctx.path.match(/^\/api\/upload\/[^/]+\/chunk$/)) {
+    await next();
+    return;
+  }
+  await koaBody({
     multipart: true,
     formidable: {
       uploadDir: UPLOAD_DIR,
       keepExtensions: true,
-      maxFileSize: 130 * 1024 * 1024, // 略大于最大分片 100 MB
+      maxFileSize: 130 * 1024 * 1024,
     },
-  })
-);
+  })(ctx, next);
+});
+
 app.use(serve(path.join(__dirname, '../public')));
 
 // 聊天图片 /uploads/* — 内联中间件
@@ -137,20 +155,89 @@ router.delete('/api/files/:filename', (ctx) => {
   ctx.body = { success: true };
 });
 
+// ═══════════════════════════════════════════════════════════════
+//  分片上传会话管理（持久化支持多进程）
+// ═══════════════════════════════════════════════════════════════
+
+// 内存中的会话缓存
+const uploadSessions = new Map(); // uploadId -> { originalName, totalChunks, fileSize, receivedChunks: Set, createdAt }
+
+// ─── 会话文件操作（带文件锁）──────────────────────────────
+async function acquireLock(timeout = 5000) {
+  const start = Date.now();
+  while (fs.existsSync(SESSIONS_LOCK)) {
+    if (Date.now() - start > timeout) throw new Error('获取文件锁超时');
+    await new Promise(r => setTimeout(r, 50));
+  }
+  await fs.promises.writeFile(SESSIONS_LOCK, String(process.pid));
+}
+
+async function releaseLock() {
+  try {
+    if (fs.existsSync(SESSIONS_LOCK)) fs.unlinkSync(SESSIONS_LOCK);
+  } catch (_) {}
+}
+
+function loadSessionsFromDisk() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      // 恢复 Set 结构
+      for (const [id, session] of Object.entries(data)) {
+        session.receivedChunks = new Set(session.receivedChunks || []);
+        uploadSessions.set(id, session);
+      }
+      console.log(`从磁盘恢复 ${uploadSessions.size} 个上传会话`);
+    }
+  } catch (e) {
+    console.error('加载会话失败:', e.message);
+  }
+}
+
+async function saveSessionsToDisk() {
+  try {
+    const data = {};
+    for (const [id, session] of uploadSessions) {
+      data[id] = {
+        originalName: session.originalName,
+        totalChunks: session.totalChunks,
+        fileSize: session.fileSize,
+        receivedChunks: [...session.receivedChunks],
+        createdAt: session.createdAt,
+      };
+    }
+    await fs.promises.writeFile(SESSIONS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('保存会话失败:', e.message);
+  }
+}
+
+// 定期自动保存（每 10 秒有变更时）
+let dirtyFlag = false;
+setInterval(async () => {
+  if (dirtyFlag) {
+    dirtyFlag = false;
+    await saveSessionsToDisk();
+  }
+}, 10000);
+
+function markDirty() { dirtyFlag = true; }
+
+// 启动时加载会话
+loadSessionsFromDisk();
+
 // ─── Chunked Upload Routes ───────────────────────────────────
 
-const CHUNK_DIR = path.join(__dirname, 'chunks');
-if (!fs.existsSync(CHUNK_DIR)) fs.mkdirSync(CHUNK_DIR, { recursive: true });
-
 // 初始化上传：返回 uploadId，记录文件名和总分片数
-const uploadSessions = new Map(); // uploadId -> { originalName, totalChunks, receivedChunks: Set }
-
-router.post('/api/upload/init', (ctx) => {
+router.post('/api/upload/init', async (ctx) => {
   const { fileName, totalChunks, fileSize } = ctx.request.body;
   if (!fileName || !totalChunks) { ctx.status = 400; ctx.body = { error: '缺少参数' }; return; }
+
   const uploadId = uuidv4();
   const chunkSubDir = path.join(CHUNK_DIR, uploadId);
-  fs.mkdirSync(chunkSubDir, { recursive: true });
+  await fs.promises.mkdir(chunkSubDir, { recursive: true });
+
   uploadSessions.set(uploadId, {
     originalName: fileName,
     totalChunks: Number(totalChunks),
@@ -158,45 +245,81 @@ router.post('/api/upload/init', (ctx) => {
     receivedChunks: new Set(),
     createdAt: Date.now(),
   });
+
+  markDirty();
+  await saveSessionsToDisk();
+
   ctx.body = { uploadId };
 });
 
 // 查询已上传分片（断点续传用）
-router.get('/api/upload/:uploadId/status', (ctx) => {
+router.get('/api/upload/:uploadId/status', async (ctx) => {
   const { uploadId } = ctx.params;
-  const session = uploadSessions.get(uploadId);
   const chunkSubDir = path.join(CHUNK_DIR, uploadId);
-  if (!session || !fs.existsSync(chunkSubDir)) {
-    // 若 session 丢失但目录存在（服务重启场景），从磁盘读取
-    if (fs.existsSync(chunkSubDir)) {
-      const existing = fs.readdirSync(chunkSubDir).map(Number).filter(n => !isNaN(n));
-      ctx.body = { uploadedChunks: existing };
-    } else {
-      ctx.body = { uploadedChunks: [] };
-    }
+
+  // 优先从内存读
+  const session = uploadSessions.get(uploadId);
+  if (session) {
+    ctx.body = { uploadedChunks: [...session.receivedChunks] };
     return;
   }
-  ctx.body = { uploadedChunks: [...session.receivedChunks] };
+
+  // session 丢失但目录存在，从磁盘扫描（多进程场景）
+  if (fs.existsSync(chunkSubDir)) {
+    const existing = fs.readdirSync(chunkSubDir)
+      .map(Number)
+      .filter(n => !isNaN(n));
+    ctx.body = { uploadedChunks: existing };
+    return;
+  }
+
+  ctx.body = { uploadedChunks: [] };
 });
 
-// 上传单个分片
+// 上传单个分片 — Busboy 流式解析，直写磁盘，绕过 formidable
 router.post('/api/upload/:uploadId/chunk', async (ctx) => {
   const { uploadId } = ctx.params;
-  const chunkIndex = Number(ctx.request.body?.chunkIndex ?? ctx.request.query?.chunkIndex);
-  const file = ctx.request.files?.chunk;
-
-  if (!file || isNaN(chunkIndex)) { ctx.status = 400; ctx.body = { error: '缺少分片数据' }; return; }
-
   const chunkSubDir = path.join(CHUNK_DIR, uploadId);
   if (!fs.existsSync(chunkSubDir)) {
     ctx.status = 404; ctx.body = { error: '上传会话不存在' }; return;
   }
 
-  const dest = path.join(chunkSubDir, String(chunkIndex));
-  fs.renameSync(file.filepath, dest);
+  // 从 query 取 chunkIndex（前端通过 URL 传）
+  const chunkIndex = Number(ctx.query.chunkIndex);
+  if (isNaN(chunkIndex)) { ctx.status = 400; ctx.body = { error: '缺少 chunkIndex' }; return; }
 
+  // Busboy 流式解析 multipart（不解码到内存/临时文件）
+  let chunkWritten = false;
+  await new Promise((resolve, reject) => {
+    const bb = Busboy({
+      headers: ctx.request.headers,
+      limits: { files: 1, fileSize: 130 * 1024 * 1024 },
+    });
+
+    bb.on('file', async (fieldname, stream, info) => {
+      const dest = path.join(chunkSubDir, String(chunkIndex));
+      const writeStream = fs.createWriteStream(dest);
+      stream.pipe(writeStream);
+      writeStream.on('finish', () => {
+        chunkWritten = true;
+        resolve();
+      });
+      writeStream.on('error', reject);
+      stream.on('error', reject);
+    });
+
+    bb.on('error', reject);
+    ctx.req.pipe(bb);
+  });
+
+  if (!chunkWritten) { ctx.status = 500; ctx.body = { error: '分片写入失败' }; return; }
+
+  // 更新内存中的会话
   const session = uploadSessions.get(uploadId);
-  if (session) session.receivedChunks.add(chunkIndex);
+  if (session) {
+    session.receivedChunks.add(chunkIndex);
+    markDirty();
+  }
 
   ctx.body = { ok: true, chunkIndex };
 });
@@ -219,35 +342,51 @@ router.post('/api/upload/:uploadId/merge', async (ctx) => {
 
   const ext = path.extname(fileName || '');
   const baseName = path.basename(fileName || 'file', ext);
-  // 用上传时的 uploadId 前缀保证不冲突，后缀保留原名
   const safeName = uploadId + '_' + baseName + ext;
   const dest = path.join(UPLOAD_DIR, safeName);
-
   const writeStream = fs.createWriteStream(dest);
-  await new Promise((resolve, reject) => {
-    (async () => {
-      try {
-        for (let i = 0; i < total; i++) {
-          const chunkPath = path.join(chunkSubDir, String(i));
-          await new Promise((res, rej) => {
-            const rs = fs.createReadStream(chunkPath);
-            rs.on('error', rej);
-            rs.on('end', res);
-            rs.pipe(writeStream, { end: false });
-          });
-        }
-        writeStream.end();
-        writeStream.on('finish', resolve);
-        writeStream.on('error', reject);
-      } catch (e) { reject(e); }
-    })();
-  });
 
-  // 清理分片目录
-  fs.rmSync(chunkSubDir, { recursive: true, force: true });
+  try {
+    for (let i = 0; i < total; i++) {
+      const chunkPath = path.join(chunkSubDir, String(i));
+      await pipeline(fs.createReadStream(chunkPath), writeStream, { end: false });
+    }
+    writeStream.end();
+    await new Promise(res => writeStream.on('finish', res));
+  } catch (e) {
+    writeStream.destroy();
+    ctx.status = 500; ctx.body = { error: '合并失败：' + e.message }; return;
+  }
+
+  // 清理分片目录和会话
+  await fs.promises.rm(chunkSubDir, { recursive: true, force: true });
   uploadSessions.delete(uploadId);
+  markDirty();
+  await saveSessionsToDisk();
 
-  ctx.body = { savedName: safeName, originalName: fileName, size: fs.statSync(dest).size };
+  const stat = await fs.promises.stat(dest);
+  ctx.body = { savedName: safeName, originalName: fileName, size: stat.size };
+});
+
+// 清理过期会话（超过 24 小时的）
+router.delete('/api/upload/cleanup', async (ctx) => {
+  const now = Date.now();
+  const TTL = 24 * 60 * 60 * 1000; // 24 小时
+  let cleaned = 0;
+
+  for (const [uploadId, session] of uploadSessions) {
+    if (now - session.createdAt > TTL) {
+      const chunkSubDir = path.join(CHUNK_DIR, uploadId);
+      if (fs.existsSync(chunkSubDir)) {
+        await fs.promises.rm(chunkSubDir, { recursive: true, force: true });
+      }
+      uploadSessions.delete(uploadId);
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) await saveSessionsToDisk();
+  ctx.body = { cleaned };
 });
 
 // ─── Chat Routes ────────────────────────────────────────────
@@ -344,19 +483,6 @@ function broadcast(data) {
   }
 }
 
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-
-server.listen(PORT, HOST, () => {
-  const nets = require('os').networkInterfaces();
-  const localIPs = [];
-  for (const iface of Object.values(nets)) {
-    for (const addr of iface) {
-      if (addr.family === 'IPv4' && !addr.internal) localIPs.push(addr.address);
-    }
-  }
-  console.log(`✅  Server running:`);
-  console.log(`    Local:   http://localhost:${PORT}`);
-  localIPs.forEach(ip => console.log(`    Network: http://${ip}:${PORT}`));
-  console.log(`    SQLite:  ${DB_PATH}`);
-});
+// ─── 模块导出 ──────────────────────────────────────────────
+// 导出 app 实例供 master.js 使用
+module.exports = app;

@@ -4,12 +4,14 @@
   "description": "文件上传下载 + 聊天室，基于 Koa",
   "main": "src/app.js",
   "scripts": {
-    "start": "node src/app.js",
-    "dev": "nodemon src/app.js"
+    "start": "node src/master.js",
+    "dev": "nodemon src/app.js",
+    "start:single": "node src/app.js"
   },
   "dependencies": {
     "@koa/cors": "^5.0.0",
     "better-sqlite3": "^12.9.0",
+    "busboy": "^1.6.0",
     "koa": "^2.15.3",
     "koa-body": "^6.0.1",
     "koa-router": "^12.0.1",

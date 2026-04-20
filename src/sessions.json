@@ -1,0 +1,18 @@
+{
+  "41d151dc-87ea-4860-9502-5580163201df": {
+    "originalName": "test.txt",
+    "totalChunks": 3,
+    "fileSize": 3000,
+    "receivedChunks": [
+      0
+    ],
+    "createdAt": 1776702515481
+  },
+  "f6fc7877-633b-44c7-aee2-b255e045a140": {
+    "originalName": "test.txt",
+    "totalChunks": 3,
+    "fileSize": 3000,
+    "receivedChunks": [],
+    "createdAt": 1776702565429
+  }
+}

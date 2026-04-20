@@ -98,6 +98,7 @@
     .file-item.done { border-color: var(--success); }
     .file-item.error { border-color: var(--danger); }
     .file-item.paused { border-color: var(--warning); }
+    .file-item.waiting_file { border-color: var(--warning); border-style: dashed; }
 
     .file-item-top { display: flex; align-items: center; gap: 12px; }
     .file-icon-big { font-size: 28px; flex-shrink: 0; }
@@ -125,6 +126,7 @@
     .status-badge.paused   { background: rgba(245,166,35,.15); color: var(--warning); }
     .status-badge.done     { background: rgba(67,212,158,.15); color: var(--success); }
     .status-badge.error    { background: rgba(240,90,90,.15); color: var(--danger); }
+    .status-badge.waiting_file { background: rgba(245,166,35,.15); color: var(--warning); }
 
     /* ── Overall Stats ── */
     .stats-bar {
@@ -187,11 +189,11 @@
       并发数
       <select id="concurrency-select">
         <option value="1">1 个</option>
-        <option value="2" selected>2 个</option>
+        <option value="2">2 个</option>
         <option value="3">3 个</option>
         <option value="5">5 个</option>
         <option value="8">8 个</option>
-        <option value="10">10 个</option>
+        <option value="10" selected>10 个</option>
       </select>
     </label>
   </div>
@@ -239,7 +241,7 @@
 //  Config
 // ═══════════════════════════════════════════════════
 let CHUNK_SIZE = 100 * 1024 * 1024;  // 100 MB default
-let CONCURRENCY = 2;
+let CONCURRENCY = 10;
 
 function updateChunkSize(v) {
   const map = { 1: 10, 2: 25, 3: 50, 4: 100 };
@@ -287,6 +289,52 @@ function escHtml(str) {
 }
 
 // ═══════════════════════════════════════════════════
+//  LocalStorage 持久化
+// ═══════════════════════════════════════════════════
+const LS_KEY = 'filom_upload_tasks';
+
+function saveTasksToLS() {
+  // 只保存任务元数据，不保存 file 对象
+  const data = [...tasks.values()].map(t => ({
+    id: t.id,
+    name: t.name,
+    size: t.size,
+    totalChunks: t.totalChunks,
+    chunkSize: t.chunkSize,
+    uploadId: t.uploadId,
+    status: t.status,
+    error: t.error,
+    savedName: t.savedName,
+    // 不保存 file, uploadedChunks, inFlight, abortController 等运行时数据
+  }));
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(data));
+  } catch (e) {
+    // localStorage 满了或不可用
+    console.warn('localStorage 保存失败:', e.message);
+  }
+}
+
+function loadTasksFromLS() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch (e) {
+    return [];
+  }
+}
+
+function removeTaskFromLS(id) {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw).filter(t => t.id !== id);
+    localStorage.setItem(LS_KEY, JSON.stringify(arr));
+  } catch (_) {}
+}
+
+// ═══════════════════════════════════════════════════
 //  Task State
 // ═══════════════════════════════════════════════════
 // status: 'pending' | 'uploading' | 'paused' | 'done' | 'error'
@@ -296,7 +344,7 @@ let globalSpeedBytes = 0;
 let lastSpeedTs = Date.now();
 let lastSpeedLoaded = 0;
 
-function createTask(file) {
+function createTask(file, existingUploadId = null) {
   const id = ++taskIdCounter;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const task = {
@@ -306,7 +354,7 @@ function createTask(file) {
     size: file.size,
     totalChunks,
     chunkSize: CHUNK_SIZE,
-    uploadId: null,
+    uploadId: existingUploadId,  // 如果有则复用
     uploadedChunks: new Set(),
     inFlight: new Map(),   // chunkIndex -> loadedBytes (实时进度)
     status: 'pending',
@@ -318,8 +366,10 @@ function createTask(file) {
     savedName: null,
     _lastLoaded: 0,
     _lastTs: Date.now(),
+    _needsFile: !existingUploadId,  // 是否需要用户重新选择文件
   };
   tasks.set(id, task);
+  saveTasksToLS();
   return task;
 }
 
@@ -337,13 +387,25 @@ function renderTask(task) {
   }
 
   const pct = task.size === 0 ? 100 : Math.round(task.loaded / task.size * 100);
-  const statusText = { pending:'等待中', uploading:'上传中', paused:'已暂停', done:'完成', error:'出错' }[task.status];
+  const statusText = {
+    pending:'等待选择文件',
+    uploading:'上传中',
+    paused:'已暂停',
+    done:'完成',
+    error:'出错',
+    waiting_file:'等待重新选择文件'
+  }[task.status] || task.status;
+
   const speedStr = task.status === 'uploading' && task.speedDisplay > 0 ? formatBytes(task.speedDisplay) + '/s' : '';
   const chunksStr = task.totalChunks > 1 ? `${task.uploadedChunks.size}/${task.totalChunks} 片` : '';
 
   let actionBtns = '';
-  if (task.status === 'pending' || task.status === 'paused' || task.status === 'error') {
-    actionBtns += `<button class="btn btn-primary btn-sm" onclick="startTask(${task.id})">▶ 开始</button>`;
+  if (task.status === 'pending' || task.status === 'waiting_file') {
+    // 需要用户重新选择文件
+    actionBtns += `<button class="btn btn-primary btn-sm" onclick="reSelectFile(${task.id})">📁 选择文件</button>`;
+  }
+  if (task.status === 'paused' || task.status === 'error') {
+    actionBtns += `<button class="btn btn-primary btn-sm" onclick="startTask(${task.id})">▶ 继续</button>`;
   }
   if (task.status === 'uploading') {
     actionBtns += `<button class="btn btn-ghost btn-sm" onclick="pauseTask(${task.id})">⏸ 暂停</button>`;
@@ -355,7 +417,7 @@ function renderTask(task) {
   el.className = 'file-item ' + task.status;
   el.innerHTML = `
     <div class="file-item-top">
-      <div class="file-icon-big">${fileIcon(task.name)}</div>
+      <div class="file-icon-big">${task.status === 'waiting_file' ? '⏳' : fileIcon(task.name)}</div>
       <div class="file-meta">
         <div class="name" title="${escHtml(task.name)}">${escHtml(task.name)}</div>
         <div class="info">
@@ -363,12 +425,13 @@ function renderTask(task) {
           ${chunksStr ? `<span>${chunksStr}</span>` : ''}
           ${speedStr ? `<span>⚡ ${speedStr}</span>` : ''}
           ${task.error ? `<span style="color:var(--danger)">${escHtml(task.error)}</span>` : ''}
+          ${task.uploadId ? `<span style="color:var(--text-muted)">ID: ${task.uploadId.slice(0,8)}</span>` : ''}
         </div>
       </div>
       <span class="status-badge ${task.status}">${statusText}</span>
       <div class="file-item-actions">${actionBtns}</div>
     </div>
-    ${task.status !== 'pending' ? `
+    ${task.status !== 'pending' && task.status !== 'waiting_file' ? `
     <div class="progress-wrap">
       <div class="progress-track"><div class="progress-fill ${task.status}" style="width:${pct}%"></div></div>
       <div class="progress-stats">
@@ -439,11 +502,10 @@ function uploadChunk(task, chunkIndex, signal) {
     const blob = task.file.slice(start, end);
 
     const fd = new FormData();
-    fd.append('chunkIndex', String(chunkIndex));
     fd.append('chunk', blob, task.name + '.part' + chunkIndex);
 
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload/' + task.uploadId + '/chunk');
+    xhr.open('POST', '/api/upload/' + task.uploadId + '/chunk?chunkIndex=' + chunkIndex);
 
     // 监听 abort
     let aborted = false;
@@ -540,16 +602,26 @@ async function startTask(id) {
   const task = tasks.get(id);
   if (!task || task.status === 'uploading' || task.status === 'done') return;
 
+  // 如果需要文件对象但不存在，提示用户选择
+  if (task._needsFile || !task.file) {
+    task.status = 'waiting_file';
+    renderTask(task);
+    toast('⚠️ 请重新选择文件以继续上传', 'info');
+    return;
+  }
+
   task.status = 'uploading';
   task.error = null;
   task.abortController = new AbortController();
   task.speedDisplay = 0;
+  saveTasksToLS();
   renderTask(task);
 
   try {
     // 1. 初始化（如果还没有 uploadId）
     if (!task.uploadId) {
       await initUpload(task);
+      saveTasksToLS();
     }
 
     // 2. 断点续传：拉取已上传分片列表
@@ -570,6 +642,7 @@ async function startTask(id) {
     task.status = 'done';
     task.loaded = task.size;
     task.speed = 0;
+    saveTasksToLS();
     renderTask(task);
     updateStats();
     toast('✅ ' + task.name + ' 上传完成', 'success');
@@ -583,6 +656,7 @@ async function startTask(id) {
       toast('❌ ' + task.name + '：' + e.message, 'error');
     }
     task.speed = 0;
+    saveTasksToLS();
     renderTask(task);
     updateStats();
   }
@@ -595,6 +669,7 @@ function pauseTask(id) {
   task.speed = 0;
   task.speedDisplay = 0;
   if (task.abortController) task.abortController.abort();
+  saveTasksToLS();
   renderTask(task);
   updateStats();
   toast('⏸ ' + task.name + ' 已暂停，可继续上传', 'info');
@@ -608,6 +683,7 @@ function removeTask(id) {
     if (task.abortController) task.abortController.abort();
   }
   tasks.delete(id);
+  removeTaskFromLS(id);
   const el = document.getElementById('task-' + id);
   if (el) el.remove();
   if (tasks.size === 0) {
@@ -616,9 +692,63 @@ function removeTask(id) {
   updateStats();
 }
 
+// 重新选择文件（用于页面刷新后恢复）
+function reSelectFile(taskId) {
+  const task = tasks.get(taskId);
+  if (!task) return;
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '*/*';
+
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+
+    // 验证文件一致性（大小必须匹配）
+    if (file.size !== task.size) {
+      toast('❌ 文件大小不匹配，请选择相同的文件', 'error');
+      return;
+    }
+
+    // 关联文件对象
+    task.file = file;
+    task._needsFile = false;
+    task._lastTs = Date.now();
+    task._lastLoaded = 0;
+
+    renderTask(task);
+    saveTasksToLS();
+
+    // 自动从后端拉取断点状态
+    if (task.uploadId) {
+      try {
+        const res = await fetch('/api/upload/' + task.uploadId + '/status');
+        if (res.ok) {
+          const data = await res.json();
+          const oldSize = task.uploadedChunks.size;
+          (data.uploadedChunks || []).forEach(i => task.uploadedChunks.add(i));
+          if (task.uploadedChunks.size > oldSize) {
+            task.loaded = Math.min(task.size, task.uploadedChunks.size * task.chunkSize);
+            toast(`📥 已恢复 ${task.uploadedChunks.size} 个已上传分片`, 'info');
+          }
+        }
+      } catch (_) {}
+    }
+
+    renderTask(task);
+    toast('✅ 文件已关联，自动继续上传', 'success');
+
+    // 自动开始上传
+    startTask(taskId);
+  });
+
+  input.click();
+}
+
 function startAll() {
   for (const task of tasks.values()) {
-    if (task.status === 'pending' || task.status === 'paused' || task.status === 'error') {
+    if (task.status === 'pending' || task.status === 'waiting_file' || task.status === 'paused' || task.status === 'error') {
       startTask(task.id);
     }
   }
@@ -632,8 +762,18 @@ function pauseAll() {
 
 function clearDone() {
   for (const task of [...tasks.values()]) {
-    if (task.status === 'done') removeTask(task.id);
+    if (task.status === 'done') {
+      removeTaskFromLS(task.id);
+      tasks.delete(task.id);
+      const el = document.getElementById('task-' + task.id);
+      if (el) el.remove();
+    }
   }
+  if (tasks.size === 0) {
+    document.getElementById('empty-tip').style.display = '';
+  }
+  localStorage.removeItem(LS_KEY);  // 清理已完成任务
+  updateStats();
 }
 
 // ═══════════════════════════════════════════════════
@@ -642,12 +782,33 @@ function clearDone() {
 function addFiles(files) {
   if (!files || !files.length) return;
   for (const file of files) {
-    const task = createTask(file);
-    renderTask(task);
-    // 自动开始
-    startTask(task.id);
+    // 检查是否已有相同文件的任务（通过 uploadId 匹配）
+    const existingTask = findExistingTask(file);
+    if (existingTask) {
+      // 复用已有任务的 uploadId，继续上传
+      const task = createTask(file, existingTask.uploadId);
+      task.uploadedChunks = existingTask.uploadedChunks;
+      task.loaded = existingTask.loaded || (task.uploadedChunks.size * task.chunkSize);
+      renderTask(task);
+      startTask(task.id);
+    } else {
+      const task = createTask(file);
+      renderTask(task);
+      // 自动开始
+      startTask(task.id);
+    }
   }
   updateStats();
+}
+
+// 根据文件名和大小查找已存在的任务
+function findExistingTask(file) {
+  for (const task of tasks.values()) {
+    if (task.name === file.name && task.size === file.size && task.uploadId) {
+      return task;
+    }
+  }
+  return null;
 }
 
 const dropZone = document.getElementById('drop-zone');
@@ -660,6 +821,74 @@ dropZone.addEventListener('drop', e => {
   e.preventDefault(); dropZone.classList.remove('dragover');
   addFiles(e.dataTransfer.files);
 });
+
+// ═══════════════════════════════════════════════════
+//  页面加载时恢复任务
+// ═══════════════════════════════════════════════════
+async function restoreTasks() {
+  const savedTasks = loadTasksFromLS();
+  if (savedTasks.length === 0) return;
+
+  console.log(`📥 从 localStorage 恢复 ${savedTasks.length} 个任务...`);
+
+  for (const saved of savedTasks) {
+    // 跳过已完成的
+    if (saved.status === 'done') continue;
+
+    // 创建占位任务（需要用户重新选择文件）
+    const task = {
+      id: ++taskIdCounter,
+      file: null,  // 需要重新选择
+      name: saved.name,
+      size: saved.size,
+      totalChunks: saved.totalChunks,
+      chunkSize: saved.chunkSize,
+      uploadId: saved.uploadId,
+      uploadedChunks: new Set(),
+      inFlight: new Map(),
+      status: 'waiting_file',
+      loaded: 0,
+      speed: 0,
+      speedDisplay: 0,
+      error: saved.error,
+      abortController: null,
+      savedName: null,
+      _lastLoaded: 0,
+      _lastTs: Date.now(),
+      _needsFile: true,
+    };
+    tasks.set(task.id, task);
+
+    // 尝试从后端获取已上传分片状态
+    if (task.uploadId) {
+      try {
+        const res = await fetch('/api/upload/' + task.uploadId + '/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.uploadedChunks && data.uploadedChunks.length > 0) {
+            data.uploadedChunks.forEach(i => task.uploadedChunks.add(i));
+            task.loaded = Math.min(task.size, task.uploadedChunks.size * task.chunkSize);
+            console.log(`  ✅ ${task.name}: 已恢复 ${task.uploadedChunks.size} 个分片`);
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  // 重新渲染所有恢复的任务
+  for (const task of tasks.values()) {
+    renderTask(task);
+  }
+
+  updateStats();
+
+  if (tasks.size > 0) {
+    toast(`📥 发现 ${tasks.size} 个未完成的上传任务，请重新选择文件继续`, 'info');
+  }
+}
+
+// 页面加载时自动恢复
+restoreTasks();
 </script>
 </body>
 </html>

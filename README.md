@@ -13,7 +13,9 @@
 - 分片上传：自动将大文件切分为多个分片上传，单文件无大小限制
 - 断点续传：中途关闭页面或断网后，可从断点处继续上传
 - 暂停/继续：支持随时暂停和恢复上传
-- 可配置分片大小（10 / 25 / 50 / 100 MB）和并发数（1-10，默认 2）
+- 可配置分片大小（10 / 25 / 50 / 100 MB）和并发数（1-10，默认 10）
+- **页面刷新恢复**：刷新页面后自动从 localStorage 恢复未完成任务，重新选择文件后继续上传
+- **多进程支持**：基于 Node.js cluster 自动启用多 worker 进程处理上传请求
 
 ### 实时聊天
 - WebSocket 双向通信
@@ -25,7 +27,7 @@
 
 - **后端**：Koa 2 + WebSocket + SQLite
 - **前端**：原生 HTML/CSS/JS（无框架）
-- **依赖**：Koa、koa-router、koa-body、koa-static、koa-websocket、uuid、better-sqlite3
+- **依赖**：Koa、koa-router、koa-body、koa-static、uuid、better-sqlite3
 
 ## 快速开始
 
@@ -38,7 +40,9 @@ npm install
 ### 启动服务
 
 ```bash
-node src/app.js
+npm start              # 多进程模式（推荐，自动使用 CPU 核心数）
+npm run start:single   # 单进程模式
+npm run dev            # 开发模式（单进程 + nodemon 热重载）
 ```
 
 服务默认运行在 `http://localhost:3000`
@@ -51,7 +55,7 @@ node src/app.js
 | `HOST` | 0.0.0.0 | 监听地址 |
 
 ```bash
-PORT=3100 node src/app.js
+PORT=3100 npm start
 ```
 
 ## 目录结构
@@ -59,12 +63,15 @@ PORT=3100 node src/app.js
 ```
 filom/
 ├── src/
-│   ├── app.js          # 后端主入口
+│   ├── app.js          # 后端应用逻辑（Koa + 路由 + WebSocket）
+│   ├── master.js       # Cluster 多进程主入口
 │   ├── uploads/        # 上传文件存储目录
-│   └── chunks/        # 分片上传临时目录（合并后自动清理）
+│   ├── chunks/         # 分片上传临时目录（合并后自动清理）
+│   ├── chat.db         # SQLite 聊天消息数据库
+│   └── sessions.json   # 上传会话持久化文件
 ├── public/
-│   ├── index.html     # 主页面（文件管理 + 聊天）
-│   └── upload.html    # 大文件上传页面（断点续传）
+│   ├── index.html      # 主页面（文件管理 + 聊天）
+│   └── upload.html     # 大文件上传页面（断点续传 + localStorage 恢复）
 ├── package.json
 └── README.md
 ```
@@ -95,6 +102,7 @@ filom/
 | GET | `/api/upload/:uploadId/status` | 查询已上传分片（断点续传） |
 | POST | `/api/upload/:uploadId/chunk` | 上传单个分片 |
 | POST | `/api/upload/:uploadId/merge` | 合并所有分片，完成后清理临时文件 |
+| DELETE | `/api/upload/cleanup` | 清理过期会话（超过 24 小时） |
 
 **分片上传流程：**
 
