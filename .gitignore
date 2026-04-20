@@ -4,6 +4,11 @@ node_modules/
 # 上传文件
 src/uploads/
 
+# 数据库
+src/chat.db
+src/chat.db-shm
+src/chat.db-wal
+
 # 日志
 *.log
 npm-debug.log*

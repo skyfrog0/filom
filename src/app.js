@@ -68,7 +68,7 @@ app.use(
     formidable: {
       uploadDir: UPLOAD_DIR,
       keepExtensions: true,
-      maxFileSize: 200 * 1024 * 1024,
+      maxFileSize: 130 * 1024 * 1024, // 略大于最大分片 100 MB
     },
   })
 );
@@ -108,11 +108,13 @@ router.post('/api/upload', (ctx) => {
   const files = Array.isArray(file) ? file : [file];
   const uploaded = [];
   for (const f of files) {
-    const ext = path.extname(f.originalFilename || f.newFilename || '');
-    const safeName = uuidv4() + ext;
+    const originalName = f.originalFilename || f.newFilename || '';
+    const ext = path.extname(originalName);
+    const baseName = path.basename(originalName, ext);
+    const safeName = uuidv4() + '_' + baseName + ext;
     const dest = path.join(UPLOAD_DIR, safeName);
     fs.renameSync(f.filepath, dest);
-    uploaded.push({ originalName: f.originalFilename, savedName: safeName, size: f.size });
+    uploaded.push({ originalName: originalName, savedName: safeName, size: f.size });
   }
   ctx.body = { uploaded };
 });
@@ -135,6 +137,119 @@ router.delete('/api/files/:filename', (ctx) => {
   ctx.body = { success: true };
 });
 
+// ─── Chunked Upload Routes ───────────────────────────────────
+
+const CHUNK_DIR = path.join(__dirname, 'chunks');
+if (!fs.existsSync(CHUNK_DIR)) fs.mkdirSync(CHUNK_DIR, { recursive: true });
+
+// 初始化上传：返回 uploadId，记录文件名和总分片数
+const uploadSessions = new Map(); // uploadId -> { originalName, totalChunks, receivedChunks: Set }
+
+router.post('/api/upload/init', (ctx) => {
+  const { fileName, totalChunks, fileSize } = ctx.request.body;
+  if (!fileName || !totalChunks) { ctx.status = 400; ctx.body = { error: '缺少参数' }; return; }
+  const uploadId = uuidv4();
+  const chunkSubDir = path.join(CHUNK_DIR, uploadId);
+  fs.mkdirSync(chunkSubDir, { recursive: true });
+  uploadSessions.set(uploadId, {
+    originalName: fileName,
+    totalChunks: Number(totalChunks),
+    fileSize: Number(fileSize) || 0,
+    receivedChunks: new Set(),
+    createdAt: Date.now(),
+  });
+  ctx.body = { uploadId };
+});
+
+// 查询已上传分片（断点续传用）
+router.get('/api/upload/:uploadId/status', (ctx) => {
+  const { uploadId } = ctx.params;
+  const session = uploadSessions.get(uploadId);
+  const chunkSubDir = path.join(CHUNK_DIR, uploadId);
+  if (!session || !fs.existsSync(chunkSubDir)) {
+    // 若 session 丢失但目录存在（服务重启场景），从磁盘读取
+    if (fs.existsSync(chunkSubDir)) {
+      const existing = fs.readdirSync(chunkSubDir).map(Number).filter(n => !isNaN(n));
+      ctx.body = { uploadedChunks: existing };
+    } else {
+      ctx.body = { uploadedChunks: [] };
+    }
+    return;
+  }
+  ctx.body = { uploadedChunks: [...session.receivedChunks] };
+});
+
+// 上传单个分片
+router.post('/api/upload/:uploadId/chunk', async (ctx) => {
+  const { uploadId } = ctx.params;
+  const chunkIndex = Number(ctx.request.body?.chunkIndex ?? ctx.request.query?.chunkIndex);
+  const file = ctx.request.files?.chunk;
+
+  if (!file || isNaN(chunkIndex)) { ctx.status = 400; ctx.body = { error: '缺少分片数据' }; return; }
+
+  const chunkSubDir = path.join(CHUNK_DIR, uploadId);
+  if (!fs.existsSync(chunkSubDir)) {
+    ctx.status = 404; ctx.body = { error: '上传会话不存在' }; return;
+  }
+
+  const dest = path.join(chunkSubDir, String(chunkIndex));
+  fs.renameSync(file.filepath, dest);
+
+  const session = uploadSessions.get(uploadId);
+  if (session) session.receivedChunks.add(chunkIndex);
+
+  ctx.body = { ok: true, chunkIndex };
+});
+
+// 合并分片
+router.post('/api/upload/:uploadId/merge', async (ctx) => {
+  const { uploadId } = ctx.params;
+  const { fileName, totalChunks } = ctx.request.body;
+  const chunkSubDir = path.join(CHUNK_DIR, uploadId);
+
+  if (!fs.existsSync(chunkSubDir)) { ctx.status = 404; ctx.body = { error: '上传会话不存在或已过期' }; return; }
+
+  const total = Number(totalChunks);
+  // 验证所有分片到位
+  for (let i = 0; i < total; i++) {
+    if (!fs.existsSync(path.join(chunkSubDir, String(i)))) {
+      ctx.status = 400; ctx.body = { error: `分片 ${i} 缺失，无法合并` }; return;
+    }
+  }
+
+  const ext = path.extname(fileName || '');
+  const baseName = path.basename(fileName || 'file', ext);
+  // 用上传时的 uploadId 前缀保证不冲突，后缀保留原名
+  const safeName = uploadId + '_' + baseName + ext;
+  const dest = path.join(UPLOAD_DIR, safeName);
+
+  const writeStream = fs.createWriteStream(dest);
+  await new Promise((resolve, reject) => {
+    (async () => {
+      try {
+        for (let i = 0; i < total; i++) {
+          const chunkPath = path.join(chunkSubDir, String(i));
+          await new Promise((res, rej) => {
+            const rs = fs.createReadStream(chunkPath);
+            rs.on('error', rej);
+            rs.on('end', res);
+            rs.pipe(writeStream, { end: false });
+          });
+        }
+        writeStream.end();
+        writeStream.on('finish', resolve);
+        writeStream.on('error', reject);
+      } catch (e) { reject(e); }
+    })();
+  });
+
+  // 清理分片目录
+  fs.rmSync(chunkSubDir, { recursive: true, force: true });
+  uploadSessions.delete(uploadId);
+
+  ctx.body = { savedName: safeName, originalName: fileName, size: fs.statSync(dest).size };
+});
+
 // ─── Chat Routes ────────────────────────────────────────────
 
 // 聊天历史记录
@@ -152,8 +267,10 @@ router.post('/api/chat/upload', (ctx) => {
   if (!ALLOWED_IMG.test(file.mimetype)) { ctx.status = 400; ctx.body = { error: '仅支持 JPG、PNG、GIF、WebP、SVG 格式' }; return; }
   if (file.size > 10 * 1024 * 1024) { ctx.status = 400; ctx.body = { error: '图片大小不能超过 10 MB' }; return; }
 
-  const ext = path.extname(file.originalFilename || file.newFilename || '.jpg').toLowerCase();
-  const safeName = uuidv4() + ext;
+  const originalName = file.originalFilename || file.newFilename || 'image.jpg';
+  const ext = path.extname(originalName).toLowerCase();
+  const baseName = path.basename(originalName, ext);
+  const safeName = uuidv4() + '_' + baseName + ext;
   const dest = path.join(UPLOAD_DIR, safeName);
   fs.renameSync(file.filepath, dest);
   ctx.body = { savedName: safeName, url: `/uploads/${safeName}` };
