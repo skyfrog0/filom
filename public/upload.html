@@ -366,7 +366,7 @@ function createTask(file, existingUploadId = null) {
     savedName: null,
     _lastLoaded: 0,
     _lastTs: Date.now(),
-    _needsFile: !existingUploadId,  // 是否需要用户重新选择文件
+    _needsFile: false,  // 是否需要用户重新选择文件（仅 localStorage 恢复时为 true）
   };
   tasks.set(id, task);
   saveTasksToLS();
@@ -388,7 +388,7 @@ function renderTask(task) {
 
   const pct = task.size === 0 ? 100 : Math.round(task.loaded / task.size * 100);
   const statusText = {
-    pending:'等待选择文件',
+    pending:'等待上传',
     uploading:'上传中',
     paused:'已暂停',
     done:'完成',
@@ -400,8 +400,8 @@ function renderTask(task) {
   const chunksStr = task.totalChunks > 1 ? `${task.uploadedChunks.size}/${task.totalChunks} 片` : '';
 
   let actionBtns = '';
-  if (task.status === 'pending' || task.status === 'waiting_file') {
-    // 需要用户重新选择文件
+  if (task.status === 'waiting_file') {
+    // 需要用户重新选择文件（仅页面刷新后恢复的任务）
     actionBtns += `<button class="btn btn-primary btn-sm" onclick="reSelectFile(${task.id})">📁 选择文件</button>`;
   }
   if (task.status === 'paused' || task.status === 'error') {
