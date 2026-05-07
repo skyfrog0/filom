@@ -420,6 +420,7 @@ app.use(router.routes()).use(router.allowedMethods());
 // ─── WebSocket Server ────────────────────────────────────────
 const server = http.createServer(app.callback());
 const wss = new WebSocket.Server({ server, path: '/ws/chat' });
+app.server = server;
 
 // ws → { id, name }
 const clients = new Map();

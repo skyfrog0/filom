@@ -5,8 +5,8 @@
   "main": "src/app.js",
   "scripts": {
     "start": "node src/master.js",
-    "dev": "nodemon src/app.js",
-    "start:single": "node src/app.js"
+    "dev": "nodemon src/single.js",
+    "start:single": "node src/single.js"
   },
   "dependencies": {
     "@koa/cors": "^5.0.0",
