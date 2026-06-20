@@ -41,11 +41,17 @@ npm install
 
 ```bash
 npm start              # 多进程模式（推荐，自动使用 CPU 核心数）
-npm run start:single   # 单进程模式
+npm run start:single   # 单进程模式（通过 src/single.js 监听端口）
 npm run dev            # 开发模式（单进程 + nodemon 热重载）
 ```
 
 服务默认运行在 `http://localhost:3000`
+
+说明：
+
+- `npm start` 使用 `src/master.js` 启动 Cluster 多进程服务。
+- `npm run start:single` 和 `npm run dev` 使用 `src/single.js` 启动单进程服务。
+- `src/app.js` 只负责创建 Koa 应用、路由和 WebSocket，不直接监听端口。
 
 ### 自定义配置
 
@@ -65,6 +71,7 @@ filom/
 ├── src/
 │   ├── app.js          # 后端应用逻辑（Koa + 路由 + WebSocket）
 │   ├── master.js       # Cluster 多进程主入口
+│   ├── single.js       # 单进程启动入口（start:single/dev）
 │   ├── uploads/        # 上传文件存储目录
 │   ├── chunks/         # 分片上传临时目录（合并后自动清理）
 │   ├── chat.db         # SQLite 聊天消息数据库
