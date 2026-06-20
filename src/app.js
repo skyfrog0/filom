@@ -342,8 +342,15 @@ router.post('/api/upload/:uploadId/merge', async (ctx) => {
 
   const ext = path.extname(fileName || '');
   const baseName = path.basename(fileName || 'file', ext);
-  const safeName = uploadId + '_' + baseName + ext;
-  const dest = path.join(UPLOAD_DIR, safeName);
+  // 用原始文件名，如文件已存在则加数字后缀（filename_2.ext, filename_3.ext ...）
+  let safeName = baseName + ext;
+  let dest = path.join(UPLOAD_DIR, safeName);
+  let counter = 1;
+  while (fs.existsSync(dest)) {
+    counter++;
+    safeName = baseName + '_' + counter + ext;
+    dest = path.join(UPLOAD_DIR, safeName);
+  }
   const writeStream = fs.createWriteStream(dest);
 
   try {

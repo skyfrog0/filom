@@ -440,6 +440,9 @@ function renderTask(task) {
       </div>
     </div>` : ''}
   `;
+
+  // 每次状态更新后重新排序（uploading 置顶）
+  reorderList();
 }
 
 function updateStats() {
@@ -777,10 +780,33 @@ function clearDone() {
 }
 
 // ═══════════════════════════════════════════════════
+//  列表排序：uploading 置顶，其余按 id 降序（后加入的排前面）
+// ═══════════════════════════════════════════════════
+function reorderList() {
+  const list = document.getElementById('file-list');
+  const all = [...tasks.values()];
+
+  // 排序规则：1) uploading 优先；2) 同优先级内 id 降序（新的在前）
+  const priority = s => s === 'uploading' ? 0 : 1;
+  all.sort((a, b) => {
+    const pd = priority(a.status) - priority(b.status);
+    if (pd !== 0) return pd;
+    return b.id - a.id;
+  });
+
+  // 按排序结果把 DOM 元素移动到正确位置
+  for (const task of all) {
+    const el = document.getElementById('task-' + task.id);
+    if (el) list.appendChild(el);  // appendChild 会自动移动已有元素到末尾
+  }
+}
+
+// ═══════════════════════════════════════════════════
 //  File Selection & Drop
 // ═══════════════════════════════════════════════════
 function addFiles(files) {
   if (!files || !files.length) return;
+  const newTasks = [];
   for (const file of files) {
     // 检查是否已有相同文件的任务（通过 uploadId 匹配）
     const existingTask = findExistingTask(file);
@@ -790,15 +816,19 @@ function addFiles(files) {
       task.uploadedChunks = existingTask.uploadedChunks;
       task.loaded = existingTask.loaded || (task.uploadedChunks.size * task.chunkSize);
       renderTask(task);
-      startTask(task.id);
+      newTasks.push(task.id);
     } else {
       const task = createTask(file);
       renderTask(task);
-      // 自动开始
-      startTask(task.id);
+      newTasks.push(task.id);
     }
   }
+  reorderList();
   updateStats();
+  // 并发启动所有新增任务（不 await，让各文件同时上传）
+  for (const id of newTasks) {
+    startTask(id);
+  }
 }
 
 // 根据文件名和大小查找已存在的任务
