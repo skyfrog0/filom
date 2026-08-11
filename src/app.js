@@ -129,8 +129,15 @@ router.post('/api/upload', (ctx) => {
     const originalName = f.originalFilename || f.newFilename || '';
     const ext = path.extname(originalName);
     const baseName = path.basename(originalName, ext);
-    const safeName = uuidv4() + '_' + baseName + ext;
-    const dest = path.join(UPLOAD_DIR, safeName);
+    // 用原始文件名，如文件已存在则加数字后缀（filename_2.ext, filename_3.ext ...）
+    let safeName = baseName + ext;
+    let dest = path.join(UPLOAD_DIR, safeName);
+    let counter = 1;
+    while (fs.existsSync(dest)) {
+      counter++;
+      safeName = baseName + '_' + counter + ext;
+      dest = path.join(UPLOAD_DIR, safeName);
+    }
     fs.renameSync(f.filepath, dest);
     uploaded.push({ originalName: originalName, savedName: safeName, size: f.size });
   }
